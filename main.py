@@ -6,7 +6,6 @@ import sqlite3
 import logging
 import argparse
 from datetime import datetime
-
 import anthropic
 
 psi_key = os.environ.get("PSI_API_KEY", "")
@@ -118,3 +117,115 @@ def run_batch(urls, strategy="mobile", db_path=path):
         time.sleep(request_delay)
     
     return results
+
+def summarize(result):
+    delta_line = ""
+    if "score_delta" in result:
+        direction = "improved" if result["score_delta"] > 0 else "gotten worse" if result["score_delta"] < 0 else "stayed the same"
+        delta_line = f"\n This site's score has {direction} by {abs(result['score_delta'])} points"
+
+    prompt = f""" Site: {result["url"]}
+Device: {result["strategy"]}
+Performance score: {result["performance_score"]}/100
+Largest contentful paint: {result["lcp"]}
+Cumulative layout shift: {result["cls"]}
+Total blocking time: {result["tbt"]}
+First contentful paint: {result["fcp"]}
+Speed index: {result["speed_index"]}
+{delta_line}
+
+Write 3 sentences for a business owner:
+1. Whethere their site is fast or slow, and whether it is getting better or worse
+2. The biggest problem right now
+3. One fix to prioritize first
+
+Do not use complicated language, translate the data into plain language"""
+    
+    message = ai.messages.create(
+        model = "claude-sonnet-5",
+        max_tokens = 200,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return message.content[0].text
+
+def add_summaries(results):
+    for result in results:
+        logger.info(f"Summarizing {result["url"]} ...")
+        try:
+            result["summary"] = summarize(result)
+        except Exception as e:
+            logger.error(f"Summary failed for {result["url"]}: {e}")
+            result["summary"] = "Summary unavailable due to an error"
+    return results
+
+def flag_regressions(results, threshold=-5):
+    regressions = [r for r in results if r.get("score_delta") is not None and r["score_delta"] <= threshold]
+    if regressions:
+        logger.warning(f"{len(regressions)} site regressed by more than {abs(threshold)} points")
+        for r in regressions:
+            logger.warning(f"{r["url"]}: dropped {abs(r["score_delta"])} points")
+    return regressions
+
+def load_urls(path):
+    urls = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                urls.append(line)
+    return urls
+
+def build_report(results, regressions, output_path="report.md"):
+    with open(output_path, "w") as f:
+        f.write("Website performance report")
+
+        if regressions:
+            f.write("Regressions")
+            for r in regressions:
+                f.write(f"{r["url"]} dropped {abs(r["score_delta"])} points so score is now {r["performance_score"]}/100")
+            f.write("\n\n---")
+
+        for r in results:
+            f.write(f"{r["url"]}")
+            f.write(f"Performance Score: {r["performance_score"]}/100")
+            if "score_delta" in r:
+                sign = "+" if r["score_delta"] >= 0 else ""
+                f.write(f"{sign}{r["score_delta"]} since last time")
+            f.write("\n\n")
+
+            f.write(f"Largest Contentful Paint - {r["lcp"]}")
+            f.write(f"\nCumulative Layout Shift - {r["cls"]}")
+            f.write(f"\n Total Blocking Time - {r["tbt"]}")
+            f.write(f"\n First Contentful Paint - {r["fcp"]}")
+            f.write(f"\n Speed Index - {r["speed_index"]}")
+            f.write("\n\n")
+
+            if "summary" in r:
+                f.write(f"Summary: {r["summary"]}")
+                f.write("\n\n")
+            
+            f.write("---")
+            f.write("\n\n")
+    
+    logger.info(f"Report written to {output_path}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Audit website performance via PageSpeed Insights")
+    parser.add_argument("urls_file", help="Path to a file with one URL per line (# for comments)")
+    parser.add_argument("--strategy", choices=["mobile", "desktop"], default="mobile")
+    parser.add_argument("--db", default=path, help="SQLite database path")
+    parser.add_argument("--report", default="report.md", help="Output report path")
+    parser.add_argument("--summarize", action="store_true", help="Add AI-generated summaries using Claude")
+    args = parser.parse_args()
+
+    init_db(args.db)
+    urls = load_urls(args.urls_file)
+    results = run_batch(urls, args.strategy, args.db)
+    if args.summarize:
+        results = add_summaries(results)
+    regressions = flag_regressions(results)
+    build_report(results, regressions, args.report)
+
+if __name__ == "__main__":
+    main()
+
