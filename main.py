@@ -208,24 +208,3 @@ def build_report(results, regressions, output_path="report.md"):
             f.write("\n\n")
     
     logger.info(f"Report written to {output_path}")
-
-def main():
-    parser = argparse.ArgumentParser(description="Audit website performance via PageSpeed Insights")
-    parser.add_argument("urls_file", help="Path to a file with one URL per line (# for comments)")
-    parser.add_argument("--strategy", choices=["mobile", "desktop"], default="mobile")
-    parser.add_argument("--db", default=path, help="SQLite database path")
-    parser.add_argument("--report", default="report.md", help="Output report path")
-    parser.add_argument("--summarize", action="store_true", help="Add AI-generated summaries using Claude")
-    args = parser.parse_args()
-
-    init_db(args.db)
-    urls = load_urls(args.urls_file)
-    results = run_batch(urls, args.strategy, args.db)
-    if args.summarize:
-        results = add_summaries(results)
-    regressions = flag_regressions(results)
-    build_report(results, regressions, args.report)
-
-if __name__ == "__main__":
-    main()
-
