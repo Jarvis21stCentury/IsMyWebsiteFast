@@ -1,10 +1,10 @@
 IsMyWebsitFast
 
-This is a simple tool that uses the Google PSI api and Claude api that then analyzes any given websites and returns a report with the performance score.
+This is a simple tool that uses the Google PSI api and Claude api that then analyzes the speed of any given websites and returns a report with the performance score.
 
 How it works
 
-There is a textbox where url(s) can be given, and then the Google api is called, and it retries upto 3 times. Then it will take the performance score and the core web vitals that api returns using JSON. It will then track each analysis to a local SQLite file so that you can track the score over time. And it loops over like this to every link and returns the score for each one. After that, the Claude api is used to summarize the data and then display for the user to either copy or download.
+There is a textbox where url(s) can be given, and then the Google api is called, and it retries upto 3 times. Then it will take the performance score and the core web vitals that api returns using JSON. It will then keep track of each analysis to a local SQLite file so that you can track the score over time. And it loops over like this through every link and returns the score for each one. After that, the Claude api is used to summarize the data and then display for the user to either copy or download.
 
 The files
 
