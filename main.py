@@ -1,22 +1,22 @@
 import os
 import requests
 import time
-import json
 import sqlite3
 import logging
 import argparse
 from datetime import datetime
 import anthropic
+from dotenv import load_dotenv
+
+load_dotenv()
 
 psi_key = os.environ.get("PSI_API_KEY", "")
 psi_endpoint = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 claude_key = os.environ.get("ANTHROPIC_API_KEY", "")
 path = "audits.db"
 retries = 3
-retry_breaktime = 5
-request_delay = 1.5
-
-ai = anthropic.Anthropic(api_key=claude_key)
+retry_breaktime = 5  # PSI throttles hard if you hit it too fast, this seems to be enough
+request_delay = 1.5  # stay under the free tier quota
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S",)
 logger = logging.getLogger("site_auditor")
@@ -44,7 +44,7 @@ def audit_url(url, strategy="mobile"):
         except KeyError as e:
             raise RuntimeError(f"Unexpected response, missing key: {e}")
 
-    raise RuntimeError(f"All {retries} attempts failed")
+    raise RuntimeError(f"All {retries} attempts failed: {last_error}")
 
 def _parse_psi_response(data, url, strategy):
     lighthouse = data["lighthouseResult"]
@@ -84,13 +84,12 @@ def save_result(result, db_path=path):
     conn.close()
 
 def get_previous_score(url, strategy, db_path=path):
-    conn = sqlite3.connect(db_path)
-    cursor = conn.execute(
-        """select performance_score, timestamp from audits where url = ? and strategy = ? order by timestamp desc limit 2""",
-        (url, strategy),
-    )
-    rows = cursor.fetchall()
-    conn.close()
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.execute(
+            "select performance_score, timestamp from audits where url = ? and strategy = ? order by timestamp desc limit 2",
+            (url, strategy),
+        )
+        rows = cursor.fetchall()
     return rows[1] if len(rows) > 1 else None
 
 def run_batch(urls, strategy="mobile", db_path=path):
@@ -99,6 +98,7 @@ def run_batch(urls, strategy="mobile", db_path=path):
         logger.info(f"Auditing {url}")
         try:
             result = audit_url(url, strategy)
+            # print(result)  # leave this here, useful when psi starts returning weird numbers
             save_result(result, db_path)
 
             previous = get_previous_score(url, strategy, db_path)
@@ -122,39 +122,29 @@ def summarize(result):
     delta_line = ""
     if "score_delta" in result:
         direction = "improved" if result["score_delta"] > 0 else "gotten worse" if result["score_delta"] < 0 else "stayed the same"
-        delta_line = f"\n This site's score has {direction} by {abs(result['score_delta'])} points"
+        delta_line = f"\nscore has {direction} by {abs(result['score_delta'])} points since last time"
 
-    prompt = f""" Site: {result["url"]}
-Device: {result["strategy"]}
-Performance score: {result["performance_score"]}/100
-Largest contentful paint: {result["lcp"]}
-Cumulative layout shift: {result["cls"]}
-Total blocking time: {result["tbt"]}
-First contentful paint: {result["fcp"]}
-Speed index: {result["speed_index"]}
+    prompt = f"""pagespeed results for {result["url"]} ({result["strategy"]}):
+score {result["performance_score"]}/100, LCP {result["lcp"]}, CLS {result["cls"]}, TBT {result["tbt"]}, FCP {result["fcp"]}, speed index {result["speed_index"]}
 {delta_line}
 
-Write 3 sentences for a business owner:
-1. Whethere their site is fast or slow, and whether it is getting better or worse
-2. The biggest problem right now
-3. One fix to prioritize first
+turn this into 3 short sentences a non-technical business owner would get - is the site fast or slow and trending up or down, what's the biggest problem, and what's the one thing to fix first. keep it simple, no jargon"""
 
-Do not use complicated language, translate the data into plain language"""
-    
-    message = ai.messages.create(
-        model = "claude-sonnet-5",
-        max_tokens = 200,
+    client = anthropic.Anthropic(api_key=claude_key)
+    message = client.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=200,
         messages=[{"role": "user", "content": prompt}],
     )
     return message.content[0].text
 
 def add_summaries(results):
     for result in results:
-        logger.info(f"Summarizing {result["url"]} ...")
+        logger.info(f"Summarizing {result['url']} ...")
         try:
             result["summary"] = summarize(result)
         except Exception as e:
-            logger.error(f"Summary failed for {result["url"]}: {e}")
+            logger.error(f"Summary failed for {result['url']}: {e}")
             result["summary"] = "Summary unavailable due to an error"
     return results
 
@@ -163,7 +153,7 @@ def flag_regressions(results, threshold=-5):
     if regressions:
         logger.warning(f"{len(regressions)} site regressed by more than {abs(threshold)} points")
         for r in regressions:
-            logger.warning(f"{r["url"]}: dropped {abs(r["score_delta"])} points")
+            logger.warning(f"{r['url']}: dropped {abs(r['score_delta'])} points")
     return regressions
 
 def load_urls(path):
@@ -177,55 +167,66 @@ def load_urls(path):
 
 def build_report(results, regressions, output_path="report.md"):
     with open(output_path, "w") as f:
-        f.write("Website performance report")
+        f.write("# Website Performance Report\n\n")
 
         if regressions:
-            f.write("Regressions")
+            f.write("## Regressions\n\n")
             for r in regressions:
-                f.write(f"{r["url"]} dropped {abs(r["score_delta"])} points so score is now {r["performance_score"]}/100")
-            f.write("\n\n---")
+                f.write(f"- {r['url']} dropped {abs(r['score_delta'])} points (now {r['performance_score']}/100)\n")
+            f.write("\n---\n\n")
 
         for r in results:
-            f.write(f"{r["url"]}")
-            f.write(f"Performance Score: {r["performance_score"]}/100")
+            f.write(f"## {r['url']}\n\n")
+            f.write(f"**Performance score:** {r['performance_score']}/100")
             if "score_delta" in r:
                 sign = "+" if r["score_delta"] >= 0 else ""
-                f.write(f"{sign}{r["score_delta"]} since last time")
+                f.write(f" ({sign}{r['score_delta']} since last time)")
             f.write("\n\n")
 
-            f.write(f"Largest Contentful Paint - {r["lcp"]}")
-            f.write(f"\nCumulative Layout Shift - {r["cls"]}")
-            f.write(f"\n Total Blocking Time - {r["tbt"]}")
-            f.write(f"\n First Contentful Paint - {r["fcp"]}")
-            f.write(f"\n Speed Index - {r["speed_index"]}")
-            f.write("\n\n")
+            f.write(f"- Largest Contentful Paint: {r['lcp']}\n")
+            f.write(f"- Cumulative Layout Shift: {r['cls']}\n")
+            f.write(f"- Total Blocking Time: {r['tbt']}\n")
+            f.write(f"- First Contentful Paint: {r['fcp']}\n")
+            f.write(f"- Speed Index: {r['speed_index']}\n\n")
 
             if "summary" in r:
-                f.write(f"Summary: {r["summary"]}")
-                f.write("\n\n")
-            
-            f.write("---")
-            f.write("\n\n")
-    
+                f.write(f"**Summary:** {r['summary']}\n\n")
+
+            f.write("---\n\n")
+
     logger.info(f"Report written to {output_path}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Audit website performance via PageSpeed Insights")
-    parser.add_argument("urls_file", help="Path to a file with one URL per line (# for comments)")
-    parser.add_argument("--strategy", choices=["mobile", "desktop"], default="mobile")
-    parser.add_argument("--db", default=path, help="SQLite database path")
-    parser.add_argument("--report", default="report.md", help="Output report path")
-    parser.add_argument("--summarize", action="store_true", help="Add AI-generated summaries using Claude")
+    parser = argparse.ArgumentParser(
+        description="Audit website performance with PageSpeed Insights and track score changes over time."
+    )
+    parser.add_argument("urls", help="Path to a text file with one URL per line")
+    parser.add_argument("--strategy", choices=["mobile", "desktop"], default="mobile", help="Device strategy to test (default: mobile)")
+    parser.add_argument("--db", default=path, help="sqlite file to store history in, defaults to audits.db")
+    parser.add_argument("--output", default="report.md", help="Path to write the markdown report")
+    parser.add_argument("--summarize", action="store_true", help="Generate plain-language summaries with Claude (requires ANTHROPIC_API_KEY)")
     args = parser.parse_args()
 
+    if not psi_key:
+        logger.error("PSI_API_KEY environment variable is not set")
+        raise SystemExit(1)
+    if args.summarize and not claude_key:
+        logger.error("--summarize requires the ANTHROPIC_API_KEY environment variable")
+        raise SystemExit(1)
+
+    urls = load_urls(args.urls)
+    if not urls:
+        logger.error(f"No URLs found in {args.urls}")
+        raise SystemExit(1)
+
     init_db(args.db)
-    urls = load_urls(args.urls_file)
-    results = run_batch(urls, args.strategy, args.db)
+    results = run_batch(urls, strategy=args.strategy, db_path=args.db)
+
     if args.summarize:
         results = add_summaries(results)
+
     regressions = flag_regressions(results)
-    build_report(results, regressions, args.report)
+    build_report(results, regressions, output_path=args.output)
 
 if __name__ == "__main__":
     main()
-
